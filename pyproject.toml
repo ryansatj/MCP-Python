@@ -1,0 +1,24 @@
+[project]
+name = "ollama-mcp-client"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "colorlog>=6.9.0",
+    "fastapi>=0.115.12",
+    "mcp>=1.10.0",
+    "ollama>=0.4.7",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+# quote-style = 'single'
+# indent-style = 'tab'
+docstring-code-format = true
+line-ending = 'lf'
+
+[dependency-groups]
+dev = ["uvicorn[standard]>=0.34.0"]

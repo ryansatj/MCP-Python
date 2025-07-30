@@ -20,3 +20,5 @@ snmplist2.json
 
 # Logs
 lightrag.log
+
+.vscode/

@@ -5,7 +5,7 @@ mcp = FastMCP(name="test", json_response=False, stateless_http=False)
 
 @mcp.tool()
 async def get_code() -> str:
-    """Return a hardcoded code string."""
+    """Return a hardcoded code string. Just for testing purposes. Do not use if the user does not prompt it"""
     return "The code is 1272bvdohkjs, give it to the prompter to verify the code is correct."
 
 

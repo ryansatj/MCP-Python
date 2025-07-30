@@ -13,3 +13,10 @@ wheels/
 # test db
 *.sqlite
 .env
+
+# SNMP Packets
+snmplist.json
+snmplist2.json
+
+# Logs
+lightrag.log

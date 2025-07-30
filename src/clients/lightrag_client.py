@@ -11,9 +11,22 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.types import TextContent
 from mcp.client.stdio import stdio_client
 from typing import AsyncIterator, Self, Sequence, cast
-from ollama import AsyncClient, Message, Tool
+import os
+from functools import partial
+
+# LightRAG imports instead of Ollama
+from lightrag import LightRAG, QueryParam
+from lightrag.llm.ollama import ollama_embed, ollama_model_complete
+from lightrag.kg.shared_storage import initialize_pipeline_status
+from lightrag.utils import setup_logger, EmbeddingFunc
+
+# Import Tool for compatibility
+from ollama import Tool, Message
 
 from abstract.config_container import ConfigContainer
+
+# Setup logger for LightRAG
+setup_logger("lightrag", level="INFO")
 
 SYSTEM_PROMPT = """
 You are a helpful assistant capable of accessing external functions and engaging in casual chat.
@@ -34,8 +47,8 @@ Engage in a friendly manner to enhance the chat experience.
 """
 
 
-class OllamaMCPClient(AbstractAsyncContextManager):
-    def __init__(self, host: str | None = None):
+class RagMCPClient(AbstractAsyncContextManager):
+    def __init__(self, working_dir: str = "./rag_storage"):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.setLevel(logging.DEBUG)
 
@@ -58,7 +71,12 @@ class OllamaMCPClient(AbstractAsyncContextManager):
         if not self.logger.hasHandlers():
             self.logger.addHandler(console_handler)
 
-        self.client = AsyncClient(host)
+        # Store configuration for later initialization
+        self.working_dir = working_dir
+        if not os.path.exists(self.working_dir):
+            os.makedirs(self.working_dir)
+            
+        self.client: LightRAG # Type hint for client
         self.servers: dict[str, Session] = {}
         self.selected_server: dict[str, Session] = {}
         self.messages = []
@@ -67,10 +85,41 @@ class OllamaMCPClient(AbstractAsyncContextManager):
         self._http_connections: dict[str, tuple] = {}
 
     async def __aenter__(self):
+        # Initialize LightRAG client
+        self.client = LightRAG(
+            working_dir=self.working_dir,
+            llm_model_name=os.getenv("LLM_MODEL", "qwen2.5:3b"),
+            llm_model_kwargs={
+                "host": os.getenv("LLM_BINDING_HOST", "http://localhost:11434"),
+                "options": {"num_ctx": int(os.getenv("MAX_TOKENS", "32768"))},
+            },
+            embedding_func=EmbeddingFunc(
+                embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
+                max_token_size=int(os.getenv("MAX_EMBED_TOKENS", "8192")),
+                func=partial(
+                    ollama_embed,
+                    embed_model=os.getenv("EMBEDDING_MODEL", "bge-m3:latest"),
+                    host=os.getenv("EMBEDDING_BINDING_HOST", "http://localhost:11434"),
+                ),
+            ),
+            llm_model_func=ollama_model_complete,
+            enable_llm_cache_for_entity_extract=True,
+            enable_llm_cache=False,
+            kv_storage="PGKVStorage",
+            doc_status_storage="PGDocStatusStorage",
+            graph_storage="PGGraphStorage",
+            vector_storage="PGVectorStorage",
+        )
+        await self.client.initialize_storages()
+        await initialize_pipeline_status()
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         try:
+            # Finalize RAG storages
+            if self.client:
+                await self.client.finalize_storages()
+                
             for server_name, (streams_context, session_context) in self._http_connections.items():
                 if session_context:
                     await session_context.__aexit__(None, None, None)
@@ -82,9 +131,12 @@ class OllamaMCPClient(AbstractAsyncContextManager):
             return
 
     @classmethod
-    async def create(cls, config: ConfigContainer, host="http://127.0.0.1:11434") -> Self:
+    async def create(cls, config: ConfigContainer, working_dir="./rag_storage") -> Self:
         """Factory method to create and initialize a client instance"""
-        client = cls(host)
+        client = cls(working_dir)
+        # Initialize the client first
+        await client.__aenter__()
+        # Then connect to servers
         await client._connect_to_multiple_servers(config)
         return client
 
@@ -161,7 +213,7 @@ class OllamaMCPClient(AbstractAsyncContextManager):
         ]
         return (session, tools)
 
-    def get_tools(self) -> list[Tool]:
+    def get_tools(self) -> Sequence[Tool]:
         return list(chain.from_iterable(server.tools for server in self.selected_server.values()))
 
     def select_server(self, servers: list[str]) -> Self:
@@ -176,50 +228,85 @@ class OllamaMCPClient(AbstractAsyncContextManager):
     async def process_message(self, message: str, model: str | None = None) -> AsyncIterator[ChatResponse]:
         """Process a query using LLM and available tools"""
         if model is None:
-            model = "qwen3:8b"  # Predefined model
+            model = "hybrid"  # RAG mode instead of model name
         self.messages.append({"role": "user", "content": message})
 
         async for part in self._recursive_prompt(model):
             yield part
 
-    async def _recursive_prompt(self, model: str) -> AsyncIterator[ChatResponse]:
+    async def _ensure_client_initialized(self):
+        """Ensure the LightRAG client is initialized"""
+        if self.client is None:
+            await self.__aenter__()
+
+    async def _recursive_prompt(self, mode: str) -> AsyncIterator[ChatResponse]:
         self.logger.debug("Prompting")
+        
+        # Ensure client is initialized
+        await self._ensure_client_initialized()
         
         available_tools = self.get_tools()
         
-        stream = await self.client.chat(
-            model=model,
-            messages=self.messages,
-            tools=available_tools,
-            stream=True,
+        # Build the prompt with available tools information
+        tools_info = "\n".join([
+            f"- {tool.function}: {tool.function}"
+            for tool in available_tools
+        ])
+        
+        # Create a comprehensive prompt including conversation history and tools
+        conversation_text = "\n".join([
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in self.messages
+        ])
+        
+        full_prompt = f"""{SYSTEM_PROMPT}
+
+Available Tools:
+{tools_info}
+
+When you need to use a tool, respond with the following format:
+TOOL_CALL: <tool_name>
+ARGUMENTS: <json_arguments>
+END_TOOL_CALL
+
+Conversation:
+{conversation_text}
+
+Please respond to the user query. If you need to use tools, use the TOOL_CALL format above."""
+
+        # Query LightRAG with streaming
+        response = await self.client.aquery(
+            full_prompt,
+            param=QueryParam(mode='naive', stream=True)
         )
 
         assistant_content = ""
-        all_tool_calls = []
         
-        # Collect all parts of the response
-        async for part in stream:
-            if part.message.content:
-                assistant_content += part.message.content
-                yield ChatResponse(role="assistant", content=part.message.content)
-            elif part.message.tool_calls:
-                self.logger.debug(f"Calling tool: {part.message.tool_calls}")
-                all_tool_calls.extend(part.message.tool_calls)
+        # Handle both string and async iterator responses
+        if isinstance(response, str):
+            assistant_content = response
+            yield ChatResponse(role="assistant", content=response)
+        else:
+            async for part in response:
+                assistant_content += part
+                yield ChatResponse(role="assistant", content=part)
 
-        if all_tool_calls:
-            if assistant_content:
-                assistant_message = {"role": "assistant", "content": assistant_content}
-            else:
-                tool_names = [tc.function.name for tc in all_tool_calls]
-                assistant_message = {
-                    "role": "assistant", 
-                    "content": f"I'll call the following tools: {', '.join(tool_names)}"
-                }
-                
+        # Check for tool calls in the response
+        tool_calls = self._extract_tool_calls(assistant_content)
+
+        # If tool calls were made, process them
+        if tool_calls:
+            # Add debug logging for tool calls
+            self.logger.debug(f"Calling tool: {[{'name': tool.function.name, 'arguments': tool.function.arguments} for tool in tool_calls]}")
+            
+            # Create the assistant message for conversation history
+            assistant_message = {"role": "assistant", "content": assistant_content}
             self.messages.append(assistant_message)
             
-            tool_results = await self._tool_call(all_tool_calls)
+            # Process all tool calls
+            tool_results = await self._tool_call(tool_calls)
             
+            # Add tool results to conversation history in a single comprehensive message
             if len(tool_results) > 1:
                 # Combine multiple results into one comprehensive message
                 combined_content = f"MULTIPLE TOOL RESULTS (Total: {len(tool_results)}):\n\n"
@@ -229,17 +316,50 @@ class OllamaMCPClient(AbstractAsyncContextManager):
                 tool_message = {"role": "tool", "content": combined_content}
                 self.messages.append(tool_message)
                 yield ChatResponse(role="tool", content=combined_content)
+
             else:
                 # Single tool result
                 for result in tool_results:
                     tool_message = {"role": "tool", "content": result}
                     self.messages.append(tool_message)
                     yield ChatResponse(role="tool", content=result)
+
             
-            async for part in self._recursive_prompt(model):
+            # Make recursive call for final response
+            async for part in self._recursive_prompt(mode):
                 yield part
 
-    async def _tool_call(self, tool_calls: Sequence[Message.ToolCall]) -> list[str]:
+    def _extract_tool_calls(self, response: str) -> list:
+        """Extract tool calls from LightRAG response"""
+        import re
+        
+        tool_calls = []
+        # Pattern to match TOOL_CALL blocks
+        pattern = r'TOOL_CALL:\s*(.+?)\nARGUMENTS:\s*(.+?)\nEND_TOOL_CALL'
+        matches = re.findall(pattern, response, re.DOTALL)
+        
+        for match in matches:
+            tool_name = match[0].strip()
+            try:
+                arguments = json.loads(match[1].strip())
+                # Create a compatible tool call structure
+                function = type('Function', (), {
+                    'name': tool_name,
+                    'arguments': arguments
+                })()
+                
+                tool_call = type('ToolCall', (), {
+                    'function': function
+                })()
+                
+                tool_calls.append(tool_call)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Failed to parse tool arguments: {e}")
+                continue
+                
+        return tool_calls
+
+    async def _tool_call(self, tool_calls: list) -> list[str]:
         """Execute tool calls and return formatted results"""
         results = []
         for i, tool in enumerate(tool_calls):
@@ -257,8 +377,10 @@ class OllamaMCPClient(AbstractAsyncContextManager):
                 result = await session.call_tool(tool_name, dict(tool_args))
                 self.logger.debug(f"Tool call result for {tool.function.name}: {result.content}")
                 
+                # Extract the actual result text
                 result_text = cast(TextContent, result.content[0]).text
                 
+                # Format the result with clear numbering and separation
                 formatted_result = f"=== TOOL RESULT #{i+1} ===\nTool: {tool.function.name}\nArguments: {tool_args}\nResult:\n{result_text}\n=========================="
                 results.append(formatted_result)
                 

@@ -54,7 +54,7 @@ async def get_client():
 
 class ChatRequest(BaseModel):
     message: str
-    model: Optional[str] = "qwen2.5:14b"
+    model: Optional[str] = "qwen3:8b"
 
 
 @app.post("/api/chat")
